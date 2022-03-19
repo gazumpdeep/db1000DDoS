@@ -2,15 +2,14 @@ package jobs
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"strconv"
+	"sync"
 	"time"
 
-	"github.com/Arriven/db1000n/src/dnsblast"
-	"github.com/Arriven/db1000n/src/logs"
+	"go.uber.org/zap"
+
+	"github.com/Arriven/db1000n/src/core/dnsblast"
 	"github.com/Arriven/db1000n/src/utils"
 )
 
@@ -22,29 +21,34 @@ const (
 
 type dnsBlastConfig struct {
 	BasicJobConfig
-	TargetServerIP   string   `json:"target_server_ip"`
-	TargetServerPort int      `json:"target_server_port"`
-	Protocol         string   `json:"protocol"` // "udp", "tcp", "tcp-tls"
-	SeedDomains      []string `json:"seed_domains"`
-	ParallelQueries  int      `json:"parallel_queries"`
+	RootDomain      string   `mapstructure:"root_domain"`
+	Protocol        string   `mapstructure:"protocol"` // "udp", "tcp", "tcp-tls"
+	SeedDomains     []string `mapstructure:"seed_domains"`
+	ParallelQueries int      `mapstructure:"parallel_queries"`
 }
 
-func dnsBlastJob(ctx context.Context, l *logs.Logger, args Args) error {
-	defer utils.PanicHandler()
+func dnsBlastJob(ctx context.Context, logger *zap.Logger, globalConfig GlobalConfig, args Args) (data interface{}, err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer utils.PanicHandler(logger)
 
-	jobConfig := new(dnsBlastConfig)
-	err := json.Unmarshal(args, &jobConfig)
-	if err != nil {
-		return fmt.Errorf("failed to parse DNS Blast job configurations: %s", err)
+	var jobConfig dnsBlastConfig
+	if err = utils.Decode(args, &jobConfig); err != nil {
+		return nil, fmt.Errorf("failed to parse DNS Blast job configurations: %w", err)
 	}
 
 	//
 	// Default settings and early misconfiguration prevention
 	//
 
+	// Root domain verification
+	if len(jobConfig.RootDomain) == 0 {
+		return nil, errors.New("no root domain provided, consider adding it")
+	}
+
 	// Domain seeds verification
 	if len(jobConfig.SeedDomains) == 0 {
-		return errors.New("no seed domains provided, at least one is required")
+		return nil, errors.New("no seed domains provided, at least one is required")
 	}
 
 	// Protocol settlement
@@ -53,30 +57,12 @@ func dnsBlastJob(ctx context.Context, l *logs.Logger, args Args) error {
 	isTCPTLSProto := jobConfig.Protocol == dnsblast.TCPTLSProtoName
 
 	switch {
-
 	case jobConfig.Protocol == "":
 		jobConfig.Protocol = defaultProto
-		isUDPProto = true
 
 	case !(isUDPProto || !isTCPProto || !isTCPTLSProto):
-		return fmt.Errorf("unrecognized DNS protocol [provided], expected one of [%v]",
+		return nil, fmt.Errorf("unrecognized DNS protocol [provided], expected one of [%v]",
 			[]string{dnsblast.UDPProtoName, dnsblast.TCPProtoName, dnsblast.TCPTLSProtoName})
-	}
-
-	// IP address validation
-	if targetIP := net.ParseIP(jobConfig.TargetServerIP); targetIP == nil {
-		return fmt.Errorf("target server address is not an IP address [provided=%s]",
-			jobConfig.TargetServerIP)
-	}
-
-	// Port validation
-	if jobConfig.TargetServerPort == 0 {
-		switch {
-		case isUDPProto, isTCPProto:
-			jobConfig.TargetServerPort = dnsblast.DefaultDNSPort
-		case isTCPTLSProto:
-			jobConfig.TargetServerPort = dnsblast.DefaultDNSOverTLSPort
-		}
 	}
 
 	// Concurrency validation
@@ -89,14 +75,21 @@ func dnsBlastJob(ctx context.Context, l *logs.Logger, args Args) error {
 		jobConfig.IntervalMs = defaultIntervalInMS
 	}
 
+	var wg sync.WaitGroup
+
 	//
 	// Blast the Job!
 	//
-	return dnsblast.Start(ctx, l, &dnsblast.Config{
-		TargetServerHostPort: net.JoinHostPort(jobConfig.TargetServerIP, strconv.Itoa(jobConfig.TargetServerPort)),
-		Protocol:             jobConfig.Protocol,
-		SeedDomains:          jobConfig.SeedDomains,
-		ParallelQueries:      jobConfig.ParallelQueries,
-		Delay:                time.Duration(jobConfig.IntervalMs) * time.Millisecond,
+	err = dnsblast.Start(ctx, logger, &wg, &dnsblast.Config{
+		RootDomain:      jobConfig.RootDomain,
+		Protocol:        jobConfig.Protocol,
+		SeedDomains:     jobConfig.SeedDomains,
+		ParallelQueries: jobConfig.ParallelQueries,
+		Delay:           time.Duration(jobConfig.IntervalMs) * time.Millisecond,
+		ClientID:        globalConfig.ClientID,
 	})
+
+	wg.Wait()
+
+	return nil, err
 }

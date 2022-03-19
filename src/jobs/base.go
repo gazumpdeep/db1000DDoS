@@ -1,44 +1,88 @@
+// Package jobs [contains all the attack types db1000n can simulate]
 package jobs
 
 import (
 	"context"
-	"encoding/json"
+	"time"
 
-	"github.com/Arriven/db1000n/src/logs"
+	"go.uber.org/zap"
+
+	"github.com/Arriven/db1000n/src/utils/templates"
 )
 
 // Args comment for linter
-type Args = json.RawMessage
+type Args = map[string]interface{}
+
+// GlobalConfig is a struct meant to pass commandline arguments to every job
+type GlobalConfig struct {
+	ProxyURL            string
+	ScaleFactor         int
+	SkipEncrypted       bool
+	Debug               bool
+	ClientID            string
+	EnablePrimitiveJobs bool
+}
+
+const (
+	isEncryptedContextKey = "is_in_encrypted_context"
+)
+
+func isInEncryptedContext(ctx context.Context) bool {
+	return ctx.Value(templates.ContextKey(isEncryptedContextKey)) != nil
+}
 
 // Job comment for linter
-type Job = func(context.Context, *logs.Logger, Args) error
+type Job = func(ctx context.Context, logger *zap.Logger, globalConfig GlobalConfig, args Args) (data interface{}, err error)
 
 // Config comment for linter
 type Config struct {
-	Type  string
-	Count int
-	Args  Args
+	Name   string `mapstructure:"name"`
+	Type   string `mapstructure:"type"`
+	Count  int    `mapstructure:"count"`
+	Filter string `mapstructure:"filter"`
+	Args   Args   `mapstructure:"args"`
 }
 
 // Get job by type name
-func Get(t string) (Job, bool) {
-	res, ok := map[string]Job{
-		"http":       httpJob,
-		"tcp":        tcpJob,
-		"udp":        udpJob,
-		"syn-flood":  synFloodJob,
-		"slow-loris": slowLorisJob,
-		"packetgen":  packetgenJob,
-		"dns-blast":  dnsBlastJob,
-	}[t]
-
-	return res, ok
+func Get(t string) Job {
+	switch t {
+	case "http", "http-flood":
+		return fastHTTPJob
+	case "http-request":
+		return singleRequestJob
+	case "tcp":
+		return tcpJob
+	case "udp":
+		return udpJob
+	case "slow-loris":
+		return slowLorisJob
+	case "packetgen":
+		return packetgenJob
+	case "dns-blast":
+		return dnsBlastJob
+	case "sequence":
+		return sequenceJob
+	case "parallel":
+		return parallelJob
+	case "log":
+		return logJob
+	case "set-value":
+		return setVarJob
+	case "check":
+		return checkJob
+	case "loop":
+		return loopJob
+	case "encrypted":
+		return encryptedJob
+	default:
+		return nil
+	}
 }
 
 // BasicJobConfig comment for linter
 type BasicJobConfig struct {
-	IntervalMs int `json:"interval_ms,omitempty"`
-	Count      int `json:"count,omitempty"`
+	IntervalMs int `mapstructure:"interval_ms,omitempty"`
+	Count      int `mapstructure:"count,omitempty"`
 
 	iter int
 }
@@ -48,14 +92,13 @@ func (c *BasicJobConfig) Next(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
 		return false
-	default:
+	case <-time.After(time.Duration(c.IntervalMs) * time.Millisecond):
+		if c.Count <= 0 {
+			return true
+		}
+
+		c.iter++
+
+		return c.iter <= c.Count
 	}
-
-	if c.Count <= 0 {
-		return true
-	}
-
-	c.iter++
-
-	return c.iter <= c.Count
 }

@@ -1,6 +1,6 @@
-# db1000n Helm chart
+# db1000n Helm charts
 
-*If you want to use plain manifess, see manifests [here](../manifests/)*
+## If you want to use plain manifests, see [Manifests](/db1000n/advanced-docs/kubernetes/manifests/)
 
 This is a Helm chart for Kubernetes
 
@@ -8,7 +8,7 @@ This is a Helm chart for Kubernetes
 
 Make sure that you installed `helm` package on your local machine and you have connection to the Kubernetes cluster.
 
-## Install chart
+## Install a release
 
 ```bash
 cd kubernetes/helm-charts/
@@ -18,7 +18,7 @@ helm upgrade --install \
     -f values.yaml db1000n .
 ```
 
-## Destroy chart
+## Destroy a release
 
 ```bash
 helm uninstall db1000n -n db1000n

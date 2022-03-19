@@ -9,25 +9,17 @@ jobs:
     strategy:
       matrix:
         # build and publish in parallel: linux/386, linux/amd64, linux/arm64, windows/386, windows/amd64, darwin/amd64, darwin/arm64
-        goos: [linux, windows, darwin, js]
-        goarch: ["386", amd64, arm64, wasm]
+        goos: [linux, windows, darwin]
+        goarch: ["386", amd64, arm, arm64]
         exclude:
           - goarch: "386"
             goos: darwin
-          - goarch: arm64
-            goos: windows
-          - goarch: wasm
-            goos: linux
-          - goarch: wasm
+          - goarch: arm
             goos: darwin
-          - goarch: wasm
-            goos: windows
-          - goarch: "386"
-            goos: js
-          - goarch: amd64
-            goos: js
           - goarch: arm64
-            goos: js
+            goos: windows
+          - goarch: arm
+            goos: windows
     steps:
       - uses: actions/checkout@v2
       - uses: wangyoucao577/go-release-action@v1.25
@@ -35,3 +27,9 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           goos: ${{ matrix.goos }}
           goarch: ${{ matrix.goarch }}
+          build_command: make
+        env:
+          ENCRYPTION_KEYS: ${{ secrets.ENCRYPTION_KEYS }}
+          CA_PATH_VALUE: ${{ secrets.PROMETHEUS_ROOT_CA }}
+          PROMETHEUS_BASIC_AUTH: ${{ secrets.PROMETHEUS_BASIC_AUTH }}
+          DEFAULT_CONFIG_VALUE: ${{ secrets.DEFAULT_CONFIG }}

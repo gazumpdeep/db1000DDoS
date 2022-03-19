@@ -2,73 +2,95 @@ package jobs
 
 import (
 	"context"
-	"encoding/json"
-	"strconv"
+	"net"
 	"time"
 
+	"github.com/google/gopacket"
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
-	"github.com/Arriven/db1000n/src/logs"
-	"github.com/Arriven/db1000n/src/metrics"
-	"github.com/Arriven/db1000n/src/packetgen"
+	"github.com/Arriven/db1000n/src/core/packetgen"
 	"github.com/Arriven/db1000n/src/utils"
+	"github.com/Arriven/db1000n/src/utils/metrics"
 	"github.com/Arriven/db1000n/src/utils/templates"
 )
 
-func packetgenJob(ctx context.Context, l *logs.Logger, args Args) error {
-	defer utils.PanicHandler()
+func packetgenJob(ctx context.Context, logger *zap.Logger, globalConfig GlobalConfig, args Args) (data interface{}, err error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer utils.PanicHandler(logger)
+
 	type packetgenJobConfig struct {
 		BasicJobConfig
-		Packet json.RawMessage
-		Host   string
-		Port   string
+		Packet     map[string]interface{}
+		Connection packetgen.ConnectionConfig
 	}
+
 	var jobConfig packetgenJobConfig
-	err := json.Unmarshal(args, &jobConfig)
-	if err != nil {
-		l.Error("error parsing json: %v", err)
-		return err
+
+	if err := utils.Decode(args, &jobConfig); err != nil {
+		logger.Debug("error parsing job config", zap.Error(err))
+
+		return nil, err
 	}
 
-	host := templates.Execute(jobConfig.Host)
-	port, err := strconv.Atoi(templates.Execute(jobConfig.Port))
+	rawConn, err := packetgen.OpenRawConnection(jobConfig.Connection)
 	if err != nil {
-		l.Error("error parsing port: %v", err)
-		return err
+		logger.Debug("error building raw connection", zap.Error(err))
+
+		return nil, err
 	}
 
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
+	packetTpl, err := templates.ParseMapStruct(jobConfig.Packet)
+	if err != nil {
+		logger.Debug("error parsing packet", zap.Error(err))
 
-	trafficMonitor := metrics.Default.NewWriter(ctx, "traffic", uuid.New().String())
+		return nil, err
+	}
+
+	payloadBuf := gopacket.NewSerializeBuffer()
+
+	trafficMonitor := metrics.Default.NewWriter(metrics.Traffic, uuid.New().String())
+	go trafficMonitor.Update(ctx, time.Second)
 
 	for jobConfig.Next(ctx) {
-		select {
-		case <-ticker.C:
-			l.Info("Attacking %v:%v", jobConfig.Host, jobConfig.Port)
-		default:
+		if err := payloadBuf.Clear(); err != nil {
+			logger.Debug("error clearing payload buffer", zap.Error(err))
+
+			return nil, err
 		}
 
-		packetConfigBytes := []byte(templates.Execute(string(jobConfig.Packet)))
-		l.Debug("[packetgen] parsed packet config template:\n%s", string(packetConfigBytes))
+		packetConfigRaw := packetTpl.Execute(logger, ctx)
+		logger.Debug("rendered packet config template", zap.Reflect("config", packetConfigRaw))
+
 		var packetConfig packetgen.PacketConfig
-		err := json.Unmarshal(packetConfigBytes, &packetConfig)
-		if err != nil {
-			l.Error("error parsing json: %v", err)
-			return err
+		if err := utils.Decode(packetConfigRaw, &packetConfig); err != nil {
+			logger.Debug("error parsing packet config", zap.Error(err))
+
+			return nil, err
 		}
-		packetConfigBytes, err = json.Marshal(packetConfig)
+
+		packet, err := packetConfig.Build()
 		if err != nil {
-			l.Error("error marshaling back to json: %v", err)
-			return err
+			logger.Debug("error building packet", zap.Error(err))
+
+			return nil, err
 		}
-		l.Debug("[packetgen] parsed packet config:\n%v", string(packetConfigBytes))
-		len, err := packetgen.SendPacket(packetConfig, host, port)
-		if err != nil {
-			l.Error("error sending packet: %v", err)
-			return err
+
+		if err = packet.Serialize(payloadBuf); err != nil {
+			logger.Debug("error serializing packet", zap.Error(err))
+
+			return nil, err
 		}
-		trafficMonitor.Add(len)
+
+		if _, err = rawConn.WriteTo(payloadBuf.Bytes(), nil, &net.IPAddr{IP: packet.IP()}); err != nil {
+			logger.Debug("error sending packet", zap.Error(err))
+
+			return nil, err
+		}
+
+		trafficMonitor.Add(uint64(len(payloadBuf.Bytes())))
 	}
-	return nil
+
+	return nil, nil
 }
